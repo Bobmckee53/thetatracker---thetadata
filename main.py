@@ -332,6 +332,19 @@ def chain(symbol: str,
     if not g_rows:
         raise HTTPException(502, "No chain for %s %s: %s" % (sym, expiration, err))
 
+    # Strikes arrive plainly (766) or in thousandths (766000), undocumented either way.
+    # /greeks has always inferred this from the data; /chain did not, and returned whatever
+    # the feed sent. A consumer walking a strike grid would then match nothing and see an
+    # empty chain rather than an error. Same inference, same helper, one source of truth.
+    sp = None
+    try:
+        sq = spot(symbols=sym if sym in ("SPX", "XSP") else "SPX", x_ttp_key=x_ttp_key)
+        sp = sq["prices"].get(sym) or (
+            sq["prices"].get("SPX", 0) / 10.0 if sym == "XSP" else None)
+    except Exception:
+        pass
+    scale = chain_scale(g_rows, sp)
+
     q_index = {}
     if quotes:
         q_rows, _, _ = with_root_fallback(
@@ -346,8 +359,12 @@ def chain(symbol: str,
     for d in g_rows:
         k, r = col(d, "strike"), col(d, "right")
         iv = col(d, "implied_vol", "implied_volatility", "implied", "iv")
+        try:
+            k_scaled = float(k) / scale if k is not None else None
+        except (TypeError, ValueError):
+            k_scaled = None
         row = {
-            "strike": jsonable(k),
+            "strike": jsonable(k_scaled),
             "right": (str(r).upper()[:1] if r is not None else None),
             "delta": jsonable(col(d, "delta")),
             "theta": jsonable(col(d, "theta")),
@@ -363,7 +380,76 @@ def chain(symbol: str,
         out.append(row)
 
     return {"ok": True, "symbol": sym, "rootUsed": root, "expiration": expiration,
-            "count": len(out), "withQuotes": quotes, "contracts": out}
+            "count": len(out), "withQuotes": quotes, "strikeScale": scale,
+            "spotUsedForScale": sp, "contracts": out}
+
+
+def norm_expiration(raw):
+    """Expirations come back as a date, as 20260918, or as '2026-09-18' depending on the
+    call. Normalise to an ISO date string, or None if it is none of those."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime.datetime):
+        return raw.date().isoformat()
+    if isinstance(raw, datetime.date):
+        return raw.isoformat()
+    t = str(raw).strip()
+    if not t:
+        return None
+    digits = t.replace("-", "").replace("/", "")
+    if len(digits) == 8 and digits.isdigit():
+        try:
+            return datetime.date(int(digits[0:4]), int(digits[4:6]), int(digits[6:8])).isoformat()
+        except ValueError:
+            return None
+    try:
+        return datetime.date.fromisoformat(t[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+@app.get("/expirations")
+def expirations(symbol: str,
+                withinDays: int = Query(120),
+                x_ttp_key: Optional[str] = Header(None, alias="X-TTP-Key")):
+    """Which expirations actually exist for this underlying, and how many days out each is.
+
+    The Roll Choices Engine walks a strike-by-expiration surface out to a duration ceiling.
+    Without this it would have to guess dates and pay for every miss against a metered feed.
+
+    BOTH ROOTS are queried and unioned: SPX monthlies (third Friday) sit under SPX and every
+    other SPX expiration sits under SPXW, so querying one root alone returns a partial
+    calendar that looks complete."""
+    require_key(x_ttp_key)
+    sym = symbol.strip().upper()
+    today = datetime.datetime.now(PACIFIC).date()
+
+    found = {}
+    errs = []
+    for root in (sym, sym + "W"):
+        try:
+            rows = rows_of(client().option_list_expirations(root))
+        except Exception as e:
+            errs.append("%s: %s" % (root, e))
+            continue
+        for d in rows:
+            iso = norm_expiration(col(d, "expiration", "expiry", "date", "exp"))
+            if not iso:
+                continue
+            found.setdefault(iso, set()).add(root)
+
+    if not found:
+        raise HTTPException(502, "No expirations for %s (%s)" % (sym, "; ".join(errs) or "no rows"))
+
+    out = []
+    for iso in sorted(found):
+        dte = (datetime.date.fromisoformat(iso) - today).days
+        if dte < 0 or dte > withinDays:
+            continue
+        out.append({"expiration": iso, "dte": dte, "roots": sorted(found[iso])})
+
+    return {"ok": True, "symbol": sym, "asOf": today.isoformat(),
+            "withinDays": withinDays, "count": len(out), "expirations": out}
 
 
 @app.exception_handler(HTTPException)
