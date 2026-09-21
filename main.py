@@ -14,6 +14,7 @@ Environment variables (Railway, never in code):
     THETADATA_API_KEY        from the ThetaData user portal
     SERVICE_SHARED_SECRET    any long random string; the Node backend sends it as X-TTP-Key
     ALLOW_UNAUTHENTICATED    optional, "1" to disable the shared-secret check (local only)
+    THETADATA_FEED           optional, "market_value" (default) or "realtime". See FEED below.
 """
 
 import datetime
@@ -33,6 +34,23 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 API_KEY = os.getenv("THETADATA_API_KEY", "").strip()
 SHARED_SECRET = os.getenv("SERVICE_SHARED_SECRET", "").strip()
 ALLOW_OPEN = os.getenv("ALLOW_UNAUTHENTICATED", "").strip() in ("1", "true", "True")
+
+# ── FEED: Market Value vs real-time ──────────────────────────────────────────
+# Market Value is NOT an account setting and NOT a different API key. ThetaData support
+# (Anthony, Sep 21 2026) confirmed that it is separate endpoints plus a request parameter,
+# and must be asked for explicitly on every call:
+#   index spot     index_snapshot_market_value   -> market_price   (not index_snapshot_price)
+#   greeks / IV    same call, use_market_value=True (the library default is False)
+#   bid / ask      option_snapshot_market_value  -> market_bid/ask (not option_snapshot_quote)
+#   expirations    reference data, no Market Value variant exists
+# Real-time NBBO shown to subscribers is OPRA redistribution ($1,500/mo + $1.25/user). Market
+# Value is what our pricing assumes, so it is the DEFAULT, and realtime has to be chosen
+# deliberately. Greeks responses do not echo use_market_value back, so the only record of
+# which feed produced a number is the "feed" field this service stamps on every response.
+FEED = os.getenv("THETADATA_FEED", "market_value").strip().lower().replace("-", "_")
+if FEED not in ("market_value", "realtime"):
+    raise RuntimeError("THETADATA_FEED must be 'market_value' or 'realtime', got %r" % FEED)
+USE_MV = FEED == "market_value"
 
 app = FastAPI(title="ThetaData bridge", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -64,7 +82,7 @@ def client():
             _client = ThetaClient(api_key=API_KEY, dataframe_type="pandas")
         except Exception as e:
             raise HTTPException(502, "ThetaData authentication failed: %s" % e)
-        log.info("ThetaData client authenticated")
+        log.info("ThetaData client authenticated (feed=%s)", FEED)
     return _client
 
 
@@ -82,7 +100,7 @@ def require_key(x_ttp_key: Optional[str]):
 
 # A column named bid_size is not the bid. Substring matching alone reported sizes as prices.
 COL_NOISE = ("size", "exchange", "condition", "count", "sequence", "flag", "time", "ms_of_day")
-PRICE_NAMES = ("price", "last", "value", "close", "mid", "spot", "index_price")
+PRICE_NAMES = ("market_price", "price", "last", "value", "close", "mid", "spot", "index_price")
 SYMBOL_NAMES = ("symbol", "root", "sym", "ticker", "underlying")
 TIME_NAMES = ("timestamp", "time", "datetime", "quote_time")
 
@@ -183,6 +201,7 @@ def health(x_ttp_key: Optional[str] = Header(None, alias="X-TTP-Key")):
         "apiKeySet": bool(API_KEY),
         "sharedSecretSet": bool(SHARED_SECRET),
         "checkedAt": datetime.datetime.now(PACIFIC).isoformat(),
+        "feed": FEED,
     }
     try:
         c = client()
@@ -214,14 +233,16 @@ def spot(symbols: str = Query("SPX,XSP"),
         raise HTTPException(400, "No symbols given.")
     called = datetime.datetime.now(PACIFIC)
     try:
-        snap = client().index_snapshot_price(wanted)
+        c = client()
+        snap = c.index_snapshot_market_value(wanted) if USE_MV else c.index_snapshot_price(wanted)
     except HTTPException:
         # Our own errors carry the right status and the right explanation already. Without this
         # re-raise, the broad handler below relabels a missing API key (503, our configuration)
         # as an upstream failure (502, ThetaData's fault) — and sends you debugging the wrong end.
         raise
     except Exception as e:
-        raise HTTPException(502, "index_snapshot_price failed: %s" % e)
+        raise HTTPException(502, "%s failed: %s" % (
+            "index_snapshot_market_value" if USE_MV else "index_snapshot_price", e))
 
     prices, stamps = {}, {}
     for d in rows_of(snap):
@@ -244,10 +265,12 @@ def spot(symbols: str = Query("SPX,XSP"),
         except Exception:
             lag = None
 
-    out = {"ok": bool(prices), "prices": prices, "timestamps": stamps,
+    out = {"ok": bool(prices), "feed": FEED, "prices": prices, "timestamps": stamps,
            "dataTimestamp": newest, "calledAt": called.isoformat(), "feedLagSeconds": lag}
     # XSP is SPX/10, separately calculated. Each feed disagrees with itself by ~0.02 XSP points,
     # which is the noise floor of independent index calculation — report it, don't hide it.
+    # On Market Value each index also carries its own random $0.01-0.05 offset, so expect this
+    # to sit higher (up to ~0.05) than the ~0.002 seen on the real-time feed on day 1.
     if "SPX" in prices and "XSP" in prices:
         out["xspVsSpxOver10"] = round(abs(prices["XSP"] - prices["SPX"] / 10.0), 4)
     if not prices:
@@ -277,7 +300,7 @@ def greeks(symbol: str,
 
     rows, root, err = with_root_fallback(
         client().option_snapshot_greeks_first_order, sym,
-        expiration=expiration, strike="*", right="both")
+        expiration=expiration, strike="*", right="both", use_market_value=USE_MV)
     if not rows:
         raise HTTPException(502, "No chain for %s %s: %s" % (sym, expiration, err))
 
@@ -299,7 +322,7 @@ def greeks(symbol: str,
 
     iv = col(best, "implied_vol", "implied_volatility", "implied", "iv")
     return {
-        "ok": True, "symbol": sym, "rootUsed": root, "expiration": expiration,
+        "ok": True, "feed": FEED, "symbol": sym, "rootUsed": root, "expiration": expiration,
         "right": right, "strikeRequested": strike, "strikeUsed": best_k,
         "strikeSnapped": abs(best_k - strike) > 0.001,
         "underlyingSpot": sp,
@@ -328,7 +351,7 @@ def chain(symbol: str,
 
     g_rows, root, err = with_root_fallback(
         client().option_snapshot_greeks_first_order, sym,
-        expiration=expiration, strike="*", right="both")
+        expiration=expiration, strike="*", right="both", use_market_value=USE_MV)
     if not g_rows:
         raise HTTPException(502, "No chain for %s %s: %s" % (sym, expiration, err))
 
@@ -348,7 +371,7 @@ def chain(symbol: str,
     q_index = {}
     if quotes:
         q_rows, _, _ = with_root_fallback(
-            client().option_snapshot_quote, sym,
+            client().option_snapshot_market_value if USE_MV else client().option_snapshot_quote, sym,
             expiration=expiration, strike="*", right="both")
         for d in q_rows:
             k, r = col(d, "strike"), col(d, "right")
@@ -375,11 +398,11 @@ def chain(symbol: str,
         if quotes:
             q = q_index.get((str(k), (str(r).upper()[:1] if r is not None else None)))
             if q:
-                row["bid"] = jsonable(col(q, "bid"))
-                row["ask"] = jsonable(col(q, "ask"))
+                row["bid"] = jsonable(col(q, "market_bid", "bid"))
+                row["ask"] = jsonable(col(q, "market_ask", "ask"))
         out.append(row)
 
-    return {"ok": True, "symbol": sym, "rootUsed": root, "expiration": expiration,
+    return {"ok": True, "feed": FEED, "symbol": sym, "rootUsed": root, "expiration": expiration,
             "count": len(out), "withQuotes": quotes, "strikeScale": scale,
             "spotUsedForScale": sp, "contracts": out}
 
