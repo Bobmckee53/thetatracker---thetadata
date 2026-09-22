@@ -398,8 +398,18 @@ def chain(symbol: str,
         if quotes:
             q = q_index.get((str(k), (str(r).upper()[:1] if r is not None else None)))
             if q:
-                row["bid"] = jsonable(col(q, "market_bid", "bid"))
-                row["ask"] = jsonable(col(q, "market_ask", "ask"))
+                bid = jsonable(col(q, "market_bid", "bid"))
+                ask = jsonable(col(q, "market_ask", "ask"))
+                # CROSSED-QUOTE GUARD. Market Value nudges one side by a tick, and on a market only
+                # a tick wide that can push the bid past the ask (Sep 22 capture: XSP 777P 0DTE,
+                # bid 1.05 / ask 1.04). The mid is still right; the pair is not. A bid above the
+                # ask is never a real market, so show both as the mid and say so.
+                if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and bid > ask:
+                    mid = round((bid + ask) / 2.0, 4)
+                    row["quoteUncrossed"] = {"bid": bid, "ask": ask}
+                    bid = ask = mid
+                row["bid"] = bid
+                row["ask"] = ask
         out.append(row)
 
     return {"ok": True, "feed": FEED, "symbol": sym, "rootUsed": root, "expiration": expiration,
