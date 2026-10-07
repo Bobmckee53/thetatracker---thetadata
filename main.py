@@ -485,6 +485,199 @@ def expirations(symbol: str,
             "withinDays": withinDays, "count": len(out), "expirations": out}
 
 
+# ── HISTORY: index OHLC bars for the charts (build -bi) ──────────────────────────────────────
+# Index candles for SPX, XSP, VIX, NDX and RUT, replacing Yahoo's ~15-minute-delayed bars on those
+# charts. Historical bars come from index_history_ohlc / index_history_eod. ThetaData states there
+# is no Market Value history: bars are always calculated from real data (Sep 21 2026), so what keeps
+# this inside the licence is AGE. Data more than 15 minutes old is delayed data and carries no
+# exchange fee (Bob, Sep 21 — Master Brief), so the newest HISTORY_DELAY_MINUTES of bars are held
+# back, and the journal draws the present from the Market Value snapshot (/spot) instead. Whether
+# the delay may be shortened is a question for ThetaData, in writing; until then 15 is the floor
+# the brief set, and the variable only lets it go UP.
+#
+# The pure functions between the markers are exercised by test_bridge_history.py without any
+# network: they take plain row dicts, so the frame's real column names are the only unknown, and
+# every accessor below tries the likely spellings.
+# --- history begin ---
+HISTORY_DELAY_MIN = max(15, int(os.getenv("HISTORY_DELAY_MINUTES", "15") or 15))
+NY = ZoneInfo("America/New_York")
+HIST_TF = {"5m": {"interval": "5m", "step": 300, "lookback_days": 8, "sessions": 5},
+           "1h": {"interval": "1h", "step": 3600, "lookback_days": 36, "sessions": 22},
+           "d":  {"interval": None, "step": 86400, "lookback_days": 770, "sessions": None}}
+OHLC_FIELDS = ("open", "high", "low", "close")
+
+
+def hist_epoch(v):
+    """A bar's timestamp as epoch seconds. ThetaData stamps in Eastern time; a naive timestamp is
+    taken as Eastern. Returns None for anything unparseable rather than guessing."""
+    try:
+        import pandas as pd
+        ts = pd.Timestamp(v)
+        if ts is pd.NaT or pd.isna(ts):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(NY)
+        return int(ts.timestamp())
+    except Exception:
+        return None
+
+
+def hist_date(v):
+    """The calendar date (Eastern) of a daily row's date/timestamp, from a Timestamp, an ISO string
+    or an integer like 20261002."""
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 19000101 <= int(v) <= 21001231:
+            s = str(int(v))
+            return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        import pandas as pd
+        ts = pd.Timestamp(v)
+        if pd.isna(ts):
+            return None
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(NY)
+        return ts.date()
+    except Exception:
+        return None
+
+
+def hist_ohlc(d):
+    """open/high/low/close from a row, or None unless all four are positive numbers."""
+    out = []
+    for name in OHLC_FIELDS:
+        v = d.get(name)
+        if v is None:
+            for k in d:
+                if str(k).lower() == name:
+                    v = d[k]
+                    break
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if not (f > 0) or f != f:
+            return None
+        out.append(f)
+    return out
+
+
+def hist_row_time(d):
+    for k in ("timestamp", "datetime", "time", "bar_time", "created"):
+        for kk in d:
+            if str(kk).lower() == k:
+                t = hist_epoch(d[kk])
+                if t is not None:
+                    return t
+    return None
+
+
+def hist_session_open(day):
+    """Epoch of 9:30 Eastern on `day` — the time Yahoo (and so the journal) stamps a daily bar with."""
+    return int(datetime.datetime(day.year, day.month, day.day, 9, 30, tzinfo=NY).timestamp())
+
+
+def hist_intraday(rows, step, now_epoch, delay_min, sessions=None):
+    """Completed bars only: a bar is kept when its END (start + step) is at least delay_min minutes
+    old. Sorted, de-duplicated, optionally limited to the newest `sessions` trading days."""
+    cutoff = now_epoch - delay_min * 60
+    seen, bars = set(), []
+    for d in rows:
+        t = hist_row_time(d)
+        o = hist_ohlc(d)
+        if t is None or o is None or t in seen or t + step > cutoff:
+            continue
+        seen.add(t)
+        bars.append({"time": t, "open": o[0], "high": o[1], "low": o[2], "close": o[3]})
+    bars.sort(key=lambda b: b["time"])
+    if sessions:
+        days = sorted({datetime.datetime.fromtimestamp(b["time"], NY).date() for b in bars})
+        keep = set(days[-sessions:])
+        bars = [b for b in bars if datetime.datetime.fromtimestamp(b["time"], NY).date() in keep]
+    return bars
+
+
+def hist_daily(eod_rows, today_bars, now_epoch):
+    """Daily bars from end-of-day rows, each stamped 9:30 Eastern of its date. Today's end-of-day row
+    (which would be a full day's calculated values) is never used; today's candle is built from the
+    completed intraday bars that are old enough, so it is only as current as they are."""
+    today = datetime.datetime.fromtimestamp(now_epoch, NY).date()
+    seen, bars = set(), []
+    for d in eod_rows:
+        day = None
+        for k in ("date", "timestamp", "datetime", "last_trade", "created", "time"):
+            for kk in d:
+                if str(kk).lower() == k:
+                    day = hist_date(d[kk])
+                    if day:
+                        break
+            if day:
+                break
+        o = hist_ohlc(d)
+        if day is None or o is None or day >= today or day in seen:
+            continue
+        seen.add(day)
+        bars.append({"time": hist_session_open(day), "open": o[0], "high": o[1], "low": o[2], "close": o[3]})
+    bars.sort(key=lambda b: b["time"])
+    if today_bars:
+        tb = [b for b in today_bars if datetime.datetime.fromtimestamp(b["time"], NY).date() == today]
+        if tb:
+            bars.append({"time": hist_session_open(today), "open": tb[0]["open"],
+                         "high": max(b["high"] for b in tb), "low": min(b["low"] for b in tb),
+                         "close": tb[-1]["close"]})
+    return bars
+# --- history end ---
+
+_hist_cache = {}
+HIST_CACHE_S = 30
+
+
+@app.get("/history")
+def history(symbol: str,
+            tf: str = Query("d"),
+            x_ttp_key: Optional[str] = Header(None, alias="X-TTP-Key")):
+    """Index candles for a chart. tf is 5m, 1h or d. The newest HISTORY_DELAY_MINUTES (never less
+    than 15) are held back — see the note above. Every response says which feed and which cutoff."""
+    require_key(x_ttp_key)
+    sym = symbol.strip().upper()
+    cfg = HIST_TF.get(tf.strip().lower())
+    if not cfg:
+        raise HTTPException(400, "tf must be one of 5m, 1h, d.")
+    if sym not in ("SPX", "XSP", "VIX", "NDX", "RUT"):
+        raise HTTPException(400, "History is available for SPX, XSP, VIX, NDX and RUT.")
+    key = (sym, tf.strip().lower())
+    hit = _hist_cache.get(key)
+    if hit and (datetime.datetime.now().timestamp() - hit[0]) < HIST_CACHE_S:
+        return hit[1]
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_epoch = int(now.timestamp())
+    today = now.astimezone(NY).date()
+    c = client()
+    try:
+        if cfg["interval"]:
+            df = c.index_history_ohlc(sym, today - datetime.timedelta(days=cfg["lookback_days"]), today,
+                                      interval=cfg["interval"])
+            rows = rows_of(df)
+            bars = hist_intraday(rows, cfg["step"], now_epoch, HISTORY_DELAY_MIN, cfg["sessions"])
+        else:
+            eod = rows_of(c.index_history_eod(sym, today - datetime.timedelta(days=cfg["lookback_days"]), today))
+            tdf = rows_of(c.index_history_ohlc(sym, today, today, interval="5m"))
+            rows = eod
+            bars = hist_daily(eod, hist_intraday(tdf, 300, now_epoch, HISTORY_DELAY_MIN), now_epoch)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, "index history for %s %s failed: %s" % (sym, tf, e))
+    if not bars:
+        raise HTTPException(502, "No usable bars for %s %s (%d rows returned)." % (sym, tf, len(rows)))
+    body = {"ok": True, "source": "thetadata", "symbol": sym, "tf": tf.strip().lower(),
+            "delayMinutes": HISTORY_DELAY_MIN, "cutoff": datetime.datetime.fromtimestamp(now_epoch - HISTORY_DELAY_MIN * 60, PACIFIC).isoformat(),
+            "count": len(bars), "rowsReturned": len(rows),
+            "columns": sorted({str(k) for k in (rows[0] if rows else {})}),
+            "bars": bars}
+    _hist_cache[key] = (datetime.datetime.now().timestamp(), body)
+    return body
+
+
 @app.exception_handler(HTTPException)
 def http_error(_request, exc: HTTPException):
     """Errors come back as JSON with the same `ok:false` shape the Node backend already uses,
