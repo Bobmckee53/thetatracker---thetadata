@@ -499,12 +499,44 @@ def expirations(symbol: str,
 # network: they take plain row dicts, so the frame's real column names are the only unknown, and
 # every accessor below tries the likely spellings.
 # --- history begin ---
+import re
 HISTORY_DELAY_MIN = max(15, int(os.getenv("HISTORY_DELAY_MINUTES", "15") or 15))
 NY = ZoneInfo("America/New_York")
 HIST_TF = {"5m": {"interval": "5m", "step": 300, "lookback_days": 8, "sessions": 5},
            "1h": {"interval": "1h", "step": 3600, "lookback_days": 36, "sessions": 22},
            "d":  {"interval": None, "step": 86400, "lookback_days": 770, "sessions": None}}
 OHLC_FIELDS = ("open", "high", "low", "close")
+
+# ThetaData refuses a history request whose date range is too long: index_history_eod answers
+# "Too many days between start and end date; max 365 days allowed" (seen 6 Oct 2026). Rather than
+# guess each method's limit, learn it from the refusal, then fetch the range in pieces.
+_hist_max_days = {}
+HIST_MAX_CALLS = 40
+
+
+def hist_chunked(name, call, start, end):
+    """call(start, end) -> rows. Fetches [start, end]; if ThetaData refuses the range as too long, learns
+    the limit it names, and fetches the range in pieces a little under that limit. Later calls for the same
+    method go straight to pieces. Any other error is raised as it is."""
+    limit = _hist_max_days.get(name)
+    span = (end - start).days + 1
+    if not limit or span <= limit:
+        try:
+            return call(start, end)
+        except Exception as e:
+            m = re.search(r"max\s+(\d+)\s+days", str(e), re.I)
+            if not m:
+                raise
+            limit = max(1, int(m.group(1)) - 5)       # a little under, in case ThetaData counts both ends
+            _hist_max_days[name] = limit
+    if span / float(limit) > HIST_MAX_CALLS:
+        raise ValueError("%s allows %d days per request; %d days would need more than %d requests" % (name, limit, span, HIST_MAX_CALLS))
+    rows, s = [], start
+    while s <= end:
+        t = min(end, s + datetime.timedelta(days=limit - 1))
+        rows.extend(call(s, t))
+        s = t + datetime.timedelta(days=1)
+    return rows
 
 
 def hist_epoch(v):
@@ -654,12 +686,14 @@ def history(symbol: str,
     c = client()
     try:
         if cfg["interval"]:
-            df = c.index_history_ohlc(sym, today - datetime.timedelta(days=cfg["lookback_days"]), today,
-                                      interval=cfg["interval"])
-            rows = rows_of(df)
+            rows = hist_chunked("index_history_ohlc",
+                                lambda a, b: rows_of(c.index_history_ohlc(sym, a, b, interval=cfg["interval"])),
+                                today - datetime.timedelta(days=cfg["lookback_days"]), today)
             bars = hist_intraday(rows, cfg["step"], now_epoch, HISTORY_DELAY_MIN, cfg["sessions"])
         else:
-            eod = rows_of(c.index_history_eod(sym, today - datetime.timedelta(days=cfg["lookback_days"]), today))
+            eod = hist_chunked("index_history_eod",
+                               lambda a, b: rows_of(c.index_history_eod(sym, a, b)),
+                               today - datetime.timedelta(days=cfg["lookback_days"]), today)
             tdf = rows_of(c.index_history_ohlc(sym, today, today, interval="5m"))
             rows = eod
             bars = hist_daily(eod, hist_intraday(tdf, 300, now_epoch, HISTORY_DELAY_MIN), now_epoch)
