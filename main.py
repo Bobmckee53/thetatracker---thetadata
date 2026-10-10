@@ -234,7 +234,25 @@ def spot(symbols: str = Query("SPX,XSP"),
     called = datetime.datetime.now(PACIFIC)
     try:
         c = client()
-        snap = c.index_snapshot_market_value(wanted) if USE_MV else c.index_snapshot_price(wanted)
+
+        def snapshot(syms):
+            return c.index_snapshot_market_value(syms) if USE_MV else c.index_snapshot_price(syms)
+        try:
+            snap = snapshot(wanted)
+        except Exception as first:
+            # One index the plan does not carry (NDX needs a Pro index subscription, ThetaData Oct 2026) must
+            # not take the others down with it: ask again one symbol at a time and keep whatever answers.
+            if len(wanted) < 2:
+                raise
+            got = []
+            for one in wanted:
+                try:
+                    got.extend(rows_of(snapshot([one])))
+                except Exception:
+                    pass
+            if not got:
+                raise first
+            snap = got
     except HTTPException:
         # Our own errors carry the right status and the right explanation already. Without this
         # re-raise, the broad handler below relabels a missing API key (503, our configuration)
@@ -245,7 +263,7 @@ def spot(symbols: str = Query("SPX,XSP"),
             "index_snapshot_market_value" if USE_MV else "index_snapshot_price", e))
 
     prices, stamps = {}, {}
-    for d in rows_of(snap):
+    for d in (snap if isinstance(snap, list) else rows_of(snap)):
         sym = col(d, *SYMBOL_NAMES)
         if sym is None or str(sym).upper() not in wanted:
             continue
@@ -489,18 +507,27 @@ def expirations(symbol: str,
 # Index candles for SPX, XSP, VIX, NDX and RUT, replacing Yahoo's ~15-minute-delayed bars on those
 # charts. Historical bars come from index_history_ohlc / index_history_eod. ThetaData states there
 # is no Market Value history: bars are always calculated from real data (Sep 21 2026), so what keeps
-# this inside the licence is AGE. Data more than 15 minutes old is delayed data and carries no
-# exchange fee (Bob, Sep 21 — Master Brief), so the newest HISTORY_DELAY_MINUTES of bars are held
-# back, and the journal draws the present from the Market Value snapshot (/spot) instead. Whether
-# the delay may be shortened is a question for ThetaData, in writing; until then 15 is the floor
-# the brief set, and the variable only lets it go UP.
+# this inside the licence was AGE: data more than 15 minutes old carries no exchange fee (Bob,
+# Sep 21 — Master Brief), so the newest 15 minutes of bars were held back and the journal drew the
+# present from the Market Value snapshot (/spot) instead. 9 Oct 2026: Mark Friend (ThetaData, Chief
+# Growth Officer) confirmed in writing that more recent bars may be shown with no additional fee from
+# ThetaData or the exchanges, and that showing candles built from this history to signed-in
+# subscribers, unpaid beta testers included, is within Exhibit A. So the hold-back now defaults to 0:
+# only COMPLETED bars are returned (a bar still forming is never returned; the journal's live price
+# covers the present). HISTORY_DELAY_MINUTES can put a delay back without a code change.
 #
 # The pure functions between the markers are exercised by test_bridge_history.py without any
 # network: they take plain row dicts, so the frame's real column names are the only unknown, and
 # every accessor below tries the likely spellings.
 # --- history begin ---
 import re
-HISTORY_DELAY_MIN = max(15, int(os.getenv("HISTORY_DELAY_MINUTES", "15") or 15))
+def _history_delay():
+    """Minutes of bars to hold back. Default 0 (see the note above); a non-number or a negative falls back to 0."""
+    try:
+        return max(0, int(str(os.getenv("HISTORY_DELAY_MINUTES", "") or "0").strip()))
+    except (TypeError, ValueError):
+        return 0
+HISTORY_DELAY_MIN = _history_delay()
 NY = ZoneInfo("America/New_York")
 HIST_TF = {"5m": {"interval": "5m", "step": 300, "lookback_days": 8, "sessions": 5},
            "1h": {"interval": "1h", "step": 3600, "lookback_days": 36, "sessions": 22},
@@ -635,7 +662,7 @@ def hist_daily(eod_rows, today_bars, now_epoch):
     seen, bars = set(), []
     for d in eod_rows:
         day = None
-        for k in ("date", "timestamp", "datetime", "last_trade", "created", "time"):
+        for k in ("date", "created", "timestamp", "datetime", "last_trade", "time"):   # `created` is the trading date (ThetaData, Oct 2026): rows are generated 17:15 Eastern
             for kk in d:
                 if str(kk).lower() == k:
                     day = hist_date(d[kk])
@@ -666,8 +693,8 @@ HIST_CACHE_S = 30
 def history(symbol: str,
             tf: str = Query("d"),
             x_ttp_key: Optional[str] = Header(None, alias="X-TTP-Key")):
-    """Index candles for a chart. tf is 5m, 1h or d. The newest HISTORY_DELAY_MINUTES (never less
-    than 15) are held back — see the note above. Every response says which feed and which cutoff."""
+    """Index candles for a chart. tf is 5m, 1h or d. Only completed bars are returned, less the newest
+    HISTORY_DELAY_MINUTES (default 0) — see the note above. Every response says which feed and which cutoff."""
     require_key(x_ttp_key)
     sym = symbol.strip().upper()
     cfg = HIST_TF.get(tf.strip().lower())
