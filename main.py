@@ -355,6 +355,30 @@ def greeks(symbol: str,
     }
 
 
+def chain_quote_stamp(rows):
+    """The newest data timestamp found in a list of snapshot rows, as a Pacific ISO string, or None.
+    Build -cc: the journal shows this next to the time it asked, so a feed that is running behind is visible
+    instead of guessed. Rows without a readable timestamp are ignored; no timestamp at all gives None."""
+    stamps = []
+    for d in rows or []:
+        try:
+            v = col(d, *TIME_NAMES)
+        except Exception:
+            v = None
+        if v is not None:
+            stamps.append(v)
+    if not stamps:
+        return None
+    try:
+        return to_pacific(max(stamps))
+    except Exception:
+        for v in stamps:
+            out = to_pacific(v)
+            if out:
+                return out
+        return None
+
+
 @app.get("/chain")
 def chain(symbol: str,
           expiration: str,
@@ -430,9 +454,14 @@ def chain(symbol: str,
                 row["ask"] = ask
         out.append(row)
 
+    # Build -cc: when the data was stamped by the feed, and when this service answered. The journal
+    # shows both, so "is this live?" can be read off the screen. None when the feed gave no timestamp.
+    quote_ts = chain_quote_stamp(list(q_index.values()) if quotes else g_rows)
     return {"ok": True, "feed": FEED, "symbol": sym, "rootUsed": root, "expiration": expiration,
             "count": len(out), "withQuotes": quotes, "strikeScale": scale,
-            "spotUsedForScale": sp, "contracts": out}
+            "spotUsedForScale": sp, "quoteTimestamp": quote_ts,
+            "fetchedAt": datetime.datetime.now(PACIFIC).isoformat(),
+            "contracts": out}
 
 
 def norm_expiration(raw):
