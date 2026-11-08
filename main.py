@@ -768,6 +768,265 @@ def history(symbol: str,
     return body
 
 
+# ── prior close (build -ez) ─────────────────────────────────────────────────
+# WHY. "P/L Today" used to be measured from whatever the journal first saw that day — for a tester
+# who opened the journal at 2:51 PM that was a 2:51 PM mark, so a red day read green. A day's P/L
+# has to start from the PRIOR SESSION'S CLOSE, which is end-of-day history, not a snapshot.
+#
+# One request carries every open contract plus the indexes they sit on; the bridge groups the
+# contracts by (root, expiration), fetches each expiration's EOD rows once (all strikes, both rights,
+# the last ~8 calendar days so a weekend or holiday is covered), and keeps the newest completed
+# session before today (Eastern). Today's own EOD row is never used: it is not final until 17:15
+# Eastern and would make "P/L Today" zero late in the day.
+#
+# WHICH NUMBER IS THE CLOSE. ThetaData's option EOD row carries a trade `close` (the last trade of
+# the day, which on a deep-in-the-money or thinly traded strike can be hours stale or absent) and the
+# closing `bid`/`ask`. The journal marks live positions at the chain MID, so the matching prior-day
+# number is the closing mid when both sides are quoted; the trade close is the fall-back. Each
+# contract says which (`basis`), and the whole response says which session (`day`).
+#
+# The pure functions between the markers take plain row dicts and are testable without a network.
+from pydantic import BaseModel
+from fastapi import Body
+
+# --- prevclose begin ---
+PREVCLOSE_LOOKBACK_DAYS = 8
+PREVCLOSE_INDEX_LOOKBACK_DAYS = 12
+
+
+def pc_num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:
+        return None
+    return f
+
+
+def pc_field(d, *names):
+    """Exact (case-insensitive) column match only: `bid` must never pick up `bid_size`."""
+    low = {str(k).lower(): k for k in d}
+    for n in names:
+        if n in low:
+            return d[low[n]]
+    return None
+
+
+def pc_row_day(d):
+    for k in ("created", "date", "timestamp", "datetime", "last_trade", "time"):
+        v = pc_field(d, k)
+        if v is not None:
+            day = hist_date(v)
+            if day:
+                return day
+    return None
+
+
+def pc_close_of(d):
+    """(value, basis) for one EOD row: closing mid when bid and ask are both quoted, else the trade close,
+    else None."""
+    bid, ask = pc_num(pc_field(d, "bid")), pc_num(pc_field(d, "ask"))
+    if bid is not None and ask is not None and ask >= bid:
+        return round((bid + ask) / 2.0, 4), "mid"
+    last = pc_num(pc_field(d, "close"))
+    if last is not None:
+        return last, "last"
+    return None, None
+
+
+def pc_strike_scale(rows, wanted):
+    """Strikes arrive plainly (6800) or in thousandths (6800000). Compare the frame's median to the
+    median strike asked for."""
+    vals = []
+    for d in rows:
+        f = pc_num(pc_field(d, "strike"))
+        if f is not None:
+            vals.append(f)
+    if not vals or not wanted:
+        return 1.0
+    mid = sorted(vals)[len(vals) // 2]
+    want = sorted(wanted)[len(wanted) // 2]
+    return 1000.0 if abs(mid / 1000.0 - want) < abs(mid - want) else 1.0
+
+
+def pc_pick(rows, wanted, today):
+    """rows: EOD rows for ONE expiration (all strikes, both rights). wanted: list of (key, strike, right).
+    Returns ({key: {close, basis, day}}, newest_day). Only the newest session strictly before `today`
+    counts; a contract missing from that session is left out rather than filled from an older one."""
+    scale = pc_strike_scale(rows, [w[1] for w in wanted])
+    by_day = {}
+    for d in rows:
+        day = pc_row_day(d)
+        if day is None or day >= today:
+            continue
+        by_day.setdefault(day, []).append(d)
+    if not by_day:
+        return {}, None
+    newest = max(by_day)
+    out = {}
+    for key, strike, right in wanted:
+        best, best_gap = None, None
+        for d in by_day[newest]:
+            r_raw = pc_field(d, "right")
+            if r_raw is not None and not right_matches(r_raw, right):
+                continue
+            k = pc_num(pc_field(d, "strike"))
+            if k is None:
+                continue
+            gap = abs(k / scale - strike)
+            if gap > 0.011:
+                continue
+            if best_gap is None or gap < best_gap:
+                best, best_gap = d, gap
+        if best is None:
+            continue
+        v, basis = pc_close_of(best)
+        if v is None:
+            continue
+        out[key] = {"close": v, "basis": basis, "day": newest.isoformat()}
+    return out, newest
+
+
+def pc_index_close(rows, today):
+    """(close, day) of the newest EOD row strictly before today, or (None, None)."""
+    best_day, best = None, None
+    for d in rows:
+        day = pc_row_day(d)
+        c = pc_num(pc_field(d, "close"))
+        if day is None or c is None or day >= today:
+            continue
+        if best_day is None or day > best_day:
+            best_day, best = day, c
+    return best, (best_day.isoformat() if best_day else None)
+
+
+def pc_occ_key(sym):
+    return "".join(str(sym or "").split())
+# --- prevclose end ---
+
+
+class PrevCloseContract(BaseModel):
+    symbol: str = ""            # OCC symbol as the broker gave it; echoed back (spaces removed) as the key
+    underlying: str
+    expiry: str                 # YYYY-MM-DD
+    strike: float
+    right: str = "P"
+
+
+class PrevCloseBody(BaseModel):
+    contracts: List[PrevCloseContract] = []
+    indexes: List[str] = []
+
+
+_pc_cache: Dict[Any, Any] = {}
+PC_CACHE_S = 15 * 60
+PREVCLOSE_ROOTS = {"SPX": ("SPX", "SPXW"), "XSP": ("XSP",), "NDX": ("NDX", "NDXP"), "RUT": ("RUT", "RUTW"), "VIX": ("VIX", "VIXW")}
+
+
+def pc_cached(key, build):
+    now = datetime.datetime.now().timestamp()
+    hit = _pc_cache.get(key)
+    if hit and now - hit[0] < PC_CACHE_S:
+        return hit[1]
+    val = build()
+    if len(_pc_cache) > 400:
+        _pc_cache.clear()
+    _pc_cache[key] = (now, val)
+    return val
+
+
+@app.post("/prevclose")
+def prevclose(body: PrevCloseBody = Body(...),
+              x_ttp_key: Optional[str] = Header(None, alias="X-TTP-Key")):
+    """Prior-session closes for a set of option contracts and the indexes under them.
+    Response: {ok, feed, day, contracts:{OCC: close}, detail:{OCC:{close,basis,day}}, indexes:{SPX: close},
+    indexDays:{SPX: day}, missing:[OCC...], errors:[...]}. `day` is the newest session found."""
+    require_key(x_ttp_key)
+    if len(body.contracts) > 400:
+        raise HTTPException(400, "At most 400 contracts per request.")
+    # "Today" is the journal's day, which is Pacific: between 9 PM and midnight Pacific the Eastern date has already
+    # turned, and using it would hand back TODAY's close as the "prior" one and zero the tile for the evening.
+    today = datetime.datetime.now(datetime.timezone.utc).astimezone(PACIFIC).date()
+    c = client()
+
+    groups: Dict[Any, List[Any]] = {}
+    for ct in body.contracts:
+        und = (ct.underlying or "").strip().upper()
+        right = (ct.right or "P").strip().upper()[:1]
+        if right not in ("P", "C") or not und:
+            continue
+        try:
+            exp = datetime.date.fromisoformat(str(ct.expiry)[:10])
+        except ValueError:
+            continue
+        key = pc_occ_key(ct.symbol) or "%s%s%s%08d" % (und, exp.strftime("%y%m%d"), right, int(round(ct.strike * 1000)))
+        groups.setdefault((und, exp), []).append((key, float(ct.strike), right))
+
+    contracts, detail, errors, days = {}, {}, [], set()
+    for (und, exp), wanted in groups.items():
+        start = today - datetime.timedelta(days=PREVCLOSE_LOOKBACK_DAYS)
+        end = today - datetime.timedelta(days=1)
+        if exp < start:
+            # Expired more than a week ago: nothing to measure a day against.
+            continue
+        roots = PREVCLOSE_ROOTS.get(und, (und, und + "W"))
+
+        def build(und=und, exp=exp, roots=roots, start=start, end=end):
+            last_err = None
+            for root in roots:
+                try:
+                    rows = rows_of(c.option_history_eod(start, end, root, exp, strike="*", right="both"))
+                    if rows:
+                        return rows, root, None
+                except Exception as e:
+                    last_err = e
+            return [], None, last_err
+
+        rows, root, err = pc_cached(("opt", und, exp.isoformat(), today.isoformat()), build)
+        if not rows:
+            errors.append("%s %s: %s" % (und, exp.isoformat(), err or "no EOD rows"))
+            continue
+        picked, newest = pc_pick(rows, wanted, today)
+        if newest:
+            days.add(newest)
+        for k, v in picked.items():
+            contracts[k] = v["close"]
+            detail[k] = dict(v, root=root)
+
+    indexes, index_days = {}, {}
+    for raw in body.indexes or []:
+        sym = str(raw or "").strip().upper()
+        if not sym or sym in indexes:
+            continue
+
+        def build_idx(sym=sym):
+            start = today - datetime.timedelta(days=PREVCLOSE_INDEX_LOOKBACK_DAYS)
+            try:
+                return rows_of(c.index_history_eod(sym, start, today)), None
+            except Exception as e:
+                return [], e
+
+        rows, err = pc_cached(("idx", sym, today.isoformat()), build_idx)
+        close, day = pc_index_close(rows, today) if rows else (None, None)
+        if close is None:
+            errors.append("%s index: %s" % (sym, err or "no EOD rows"))
+            continue
+        indexes[sym] = close
+        index_days[sym] = day
+        if day:
+            days.add(datetime.date.fromisoformat(day))
+
+    wanted_keys = [k for g in groups.values() for (k, _s, _r) in g]
+    missing = [k for k in wanted_keys if k not in contracts]
+    return {"ok": True, "feed": FEED, "source": "thetadata",
+            "day": max(days).isoformat() if days else None,
+            "today": today.isoformat(),
+            "contracts": contracts, "detail": detail,
+            "indexes": indexes, "indexDays": index_days,
+            "missing": missing, "errors": errors}
+
+
 @app.exception_handler(HTTPException)
 def http_error(_request, exc: HTTPException):
     """Errors come back as JSON with the same `ok:false` shape the Node backend already uses,
