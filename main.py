@@ -790,8 +790,17 @@ from pydantic import BaseModel
 from fastapi import Body
 
 # --- prevclose begin ---
-PREVCLOSE_LOOKBACK_DAYS = 8
+PREVCLOSE_LOOKBACK_DAYS = 8           # the wide net, used only when the one-session pull finds nothing (a holiday)
 PREVCLOSE_INDEX_LOOKBACK_DAYS = 12
+PREVCLOSE_WORKERS = 4                 # expirations pulled side by side; measured 7 Nov 2026: one cold expiration over 8 days took 28 s
+
+
+def pc_prev_weekday(day):
+    """The weekday before `day` (Saturday and Sunday skipped; holidays are caught by the empty-result fallback)."""
+    d = day - datetime.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d
 
 
 def pc_num(v):
@@ -920,7 +929,7 @@ class PrevCloseBody(BaseModel):
 
 
 _pc_cache: Dict[Any, Any] = {}
-PC_CACHE_S = 15 * 60
+PC_CACHE_S = 20 * 3600                # a prior close does not change during the day; the key carries the day, so a day is safe
 PREVCLOSE_ROOTS = {"SPX": ("SPX", "SPXW"), "XSP": ("XSP",), "NDX": ("NDX", "NDXP"), "RUT": ("RUT", "RUTW"), "VIX": ("VIX", "VIXW")}
 
 
@@ -930,9 +939,14 @@ def pc_cached(key, build):
     if hit and now - hit[0] < PC_CACHE_S:
         return hit[1]
     val = build()
-    if len(_pc_cache) > 400:
-        _pc_cache.clear()
-    _pc_cache[key] = (now, val)
+    try:
+        empty = not val[0]            # (rows, ...) with no rows: a failure or a holiday — never remembered, so the next ask retries
+    except Exception:
+        empty = False
+    if not empty:
+        if len(_pc_cache) > 400:
+            _pc_cache.clear()
+        _pc_cache[key] = (now, val)
     return val
 
 
@@ -945,9 +959,9 @@ def prevclose(body: PrevCloseBody = Body(...),
     require_key(x_ttp_key)
     if len(body.contracts) > 400:
         raise HTTPException(400, "At most 400 contracts per request.")
-    # "Today" is the journal's day, which is Pacific: between 9 PM and midnight Pacific the Eastern date has already
-    # turned, and using it would hand back TODAY's close as the "prior" one and zero the tile for the evening.
-    today = datetime.datetime.now(datetime.timezone.utc).astimezone(PACIFIC).date()
+    # "Today" is the journal's session day, which it keeps in EASTERN time (ttpEtDay): the two must agree, or between
+    # 9 PM and midnight Pacific the journal would start a new day while the bridge still handed back the close before last.
+    today = datetime.datetime.now(datetime.timezone.utc).astimezone(NY).date()
     c = client()
 
     groups: Dict[Any, List[Any]] = {}
@@ -964,26 +978,39 @@ def prevclose(body: PrevCloseBody = Body(...),
         groups.setdefault((und, exp), []).append((key, float(ct.strike), right))
 
     contracts, detail, errors, days = {}, {}, [], set()
-    for (und, exp), wanted in groups.items():
-        start = today - datetime.timedelta(days=PREVCLOSE_LOOKBACK_DAYS)
-        end = today - datetime.timedelta(days=1)
-        if exp < start:
-            # Expired more than a week ago: nothing to measure a day against.
-            continue
+    prev = pc_prev_weekday(today)
+
+    def pull(und, exp):
+        """EOD rows for one expiration: the previous weekday alone first (cheap), the wide net only if that day was a
+        holiday. A contract that expired before the previous weekday has no prior close to measure against."""
         roots = PREVCLOSE_ROOTS.get(und, (und, und + "W"))
 
-        def build(und=und, exp=exp, roots=roots, start=start, end=end):
+        def build():
             last_err = None
-            for root in roots:
-                try:
-                    rows = rows_of(c.option_history_eod(start, end, root, exp, strike="*", right="both"))
-                    if rows:
-                        return rows, root, None
-                except Exception as e:
-                    last_err = e
+            for start, end in ((prev, prev), (today - datetime.timedelta(days=PREVCLOSE_LOOKBACK_DAYS), today - datetime.timedelta(days=1))):
+                for root in roots:
+                    try:
+                        rows = rows_of(c.option_history_eod(start, end, root, exp, strike="*", right="both"))
+                        if rows:
+                            return rows, root, None
+                    except Exception as e:
+                        last_err = e
             return [], None, last_err
+        return pc_cached(("opt", und, exp.isoformat(), today.isoformat()), build)
 
-        rows, root, err = pc_cached(("opt", und, exp.isoformat(), today.isoformat()), build)
+    work = [(und, exp, wanted) for (und, exp), wanted in groups.items() if exp >= prev]
+    results = {}
+    if work:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(PREVCLOSE_WORKERS, len(work))) as pool:
+            futs = {pool.submit(pull, und, exp): (und, exp) for (und, exp, _w) in work}
+            for f, key in futs.items():
+                try:
+                    results[key] = f.result()
+                except Exception as e:
+                    results[key] = ([], None, e)
+    for und, exp, wanted in work:
+        rows, root, err = results.get((und, exp), ([], None, None))
         if not rows:
             errors.append("%s %s: %s" % (und, exp.isoformat(), err or "no EOD rows"))
             continue
